@@ -24,7 +24,7 @@ import logging
 import sys
 import time
 from threading import Thread, Event, Lock
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -551,6 +551,496 @@ def handle_update_settings(data):
         "resolution": list(session.resolution),
         "interactive_mode": session.interactive_mode,
     })
+
+
+# ===========================================================================
+# MODULE DÉCOUVERTE RÉSEAU & RELAY MULTI-CIBLES
+# ===========================================================================
+
+# Import du scanner réseau
+try:
+    from network_scanner import (
+        NetworkScanner, ScanResult, DiscoveredHost,
+        get_local_subnet, quick_network_scan,
+    )
+    SCANNER_AVAILABLE = True
+except ImportError:
+    SCANNER_AVAILABLE = False
+    logger.warning("Module 'network_scanner' non disponible — discovery désactivé")
+
+# ---------------------------------------------------------------------------
+# État global : gestion multi-cibles
+# ---------------------------------------------------------------------------
+class TargetManager:
+    """
+    Gère la liste dynamique des cibles réseau et les sessions de relay.
+    Permet de sélectionner une machine distante et de relayer les flux
+    vers elle via le module RemoteDesktopSession.
+    """
+
+    def __init__(self):
+        self.discovered_hosts: List[dict] = []
+        self.selected_target: Optional[str] = None  # IP de la cible active
+        self.target_sessions: Dict[str, dict] = {}  # IP -> session info
+        self.scan_history: List[dict] = []
+        self.last_scan_result: Optional[dict] = None
+        self._scanner: Optional[object] = None
+        self._scan_thread: Optional[Thread] = None
+        self._is_scanning: bool = False
+        self._lock: Lock = Lock()
+
+    @property
+    def is_scanning(self) -> bool:
+        return self._is_scanning
+
+    def start_scan(self, subnet: Optional[str] = None, async_mode: bool = True):
+        """Lance un scan réseau (synchrone ou asynchrone)."""
+        if not SCANNER_AVAILABLE:
+            return {"error": "Module scanner non disponible"}
+
+        if self._is_scanning:
+            return {"error": "Scan déjà en cours"}
+
+        subnet = subnet or get_local_subnet()
+        self._is_scanning = True
+
+        def do_scan():
+            try:
+                scanner = NetworkScanner(
+                    subnet=subnet,
+                    timeout=2.0,
+                    max_workers=100,
+                    enable_banner_grab=True,
+                )
+                self._scanner = scanner
+                result = scanner.scan()
+
+                with self._lock:
+                    self.discovered_hosts = [h.to_dict() for h in result.hosts]
+                    self.last_scan_result = result.to_dict()
+                    self.scan_history.append({
+                        "timestamp": time.time(),
+                        "subnet": subnet,
+                        "hosts_found": result.hosts_found,
+                        "duration": result.duration_seconds,
+                    })
+
+                logger.info(f"Scan terminé: {result.hosts_found} hôtes trouvés")
+
+                # Notifier les clients WebSocket
+                socketio.emit("scan_complete", {
+                    "hosts_found": result.hosts_found,
+                    "duration": result.duration_seconds,
+                    "hosts": self.discovered_hosts[:50],  # Limiter à 50
+                }, namespace="/network")
+
+            except Exception as e:
+                logger.error(f"Erreur scan: {e}")
+                socketio.emit("scan_error", {"error": str(e)}, namespace="/network")
+            finally:
+                self._is_scanning = False
+
+        if async_mode:
+            self._scan_thread = Thread(target=do_scan, daemon=True)
+            self._scan_thread.start()
+            return {"status": "scanning", "subnet": subnet}
+        else:
+            do_scan()
+            return self.last_scan_result
+
+    def select_target(self, ip: str) -> dict:
+        """Sélectionne une cible pour le relay de flux."""
+        with self._lock:
+            self.selected_target = ip
+            if ip not in self.target_sessions:
+                self.target_sessions[ip] = {
+                    "ip": ip,
+                    "connected_at": time.time(),
+                    "protocol": "auto",
+                    "status": "selected",
+                    "frame_count": 0,
+                }
+            else:
+                self.target_sessions[ip]["status"] = "active"
+
+        logger.info(f"Cible sélectionnée: {ip}")
+        return {"status": "ok", "target": ip}
+
+    def get_target_info(self, ip: str) -> Optional[dict]:
+        """Retourne les informations d'une cible."""
+        # Chercher dans les hôtes découverts
+        for host in self.discovered_hosts:
+            if host.get("ip") == ip:
+                return host
+        return None
+
+    def get_all_targets(self) -> List[dict]:
+        """Retourne toutes les cibles avec leur état."""
+        targets = []
+        for host in self.discovered_hosts:
+            ip = host.get("ip", "")
+            session_info = self.target_sessions.get(ip, {})
+            targets.append({
+                **host,
+                "session_status": session_info.get("status", "idle"),
+                "is_selected": ip == self.selected_target,
+            })
+        return targets
+
+
+# Instance globale du gestionnaire de cibles
+target_manager = TargetManager()
+
+
+# ---------------------------------------------------------------------------
+# Routes REST API - Découverte Réseau
+# ---------------------------------------------------------------------------
+
+@app.route("/api/network/subnet", methods=["GET"])
+def get_local_network():
+    """Retourne le sous-réseau local détecté."""
+    if not SCANNER_AVAILABLE:
+        return jsonify({"error": "Module scanner non disponible"}), 503
+
+    subnet = get_local_subnet()
+    return jsonify({
+        "subnet": subnet,
+        "available": True,
+    })
+
+
+@app.route("/api/network/scan", methods=["POST"])
+def start_network_scan():
+    """
+    Lance un scan du réseau.
+    Body JSON optionnel: {"subnet": "192.168.1.0/24"}
+    """
+    if not SCANNER_AVAILABLE:
+        return jsonify({"error": "Module scanner non disponible"}), 503
+
+    data = request.get_json(silent=True) or {}
+    subnet = data.get("subnet")
+
+    result = target_manager.start_scan(subnet=subnet, async_mode=True)
+    return jsonify(result), 202
+
+
+@app.route("/api/network/scan/sync", methods=["POST"])
+def start_network_scan_sync():
+    """
+    Lance un scan synchrone (bloque jusqu'à la fin).
+    Utile pour les petits sous-réseaux.
+    """
+    if not SCANNER_AVAILABLE:
+        return jsonify({"error": "Module scanner non disponible"}), 503
+
+    data = request.get_json(silent=True) or {}
+    subnet = data.get("subnet")
+
+    result = target_manager.start_scan(subnet=subnet, async_mode=False)
+    return jsonify(result or {"error": "Scan échoué"})
+
+
+@app.route("/api/network/scan/status", methods=["GET"])
+def get_scan_status():
+    """Retourne le statut du scan en cours."""
+    return jsonify({
+        "is_scanning": target_manager.is_scanning,
+        "hosts_found": len(target_manager.discovered_hosts),
+        "last_scan": target_manager.last_scan_result,
+    })
+
+
+@app.route("/api/network/hosts", methods=["GET"])
+def get_discovered_hosts():
+    """Retourne la liste des hôtes découverts."""
+    return jsonify({
+        "hosts": target_manager.discovered_hosts,
+        "count": len(target_manager.discovered_hosts),
+        "last_scan": target_manager.last_scan_result.get("scan_end") if target_manager.last_scan_result else None,
+    })
+
+
+@app.route("/api/network/host/<ip>", methods=["GET"])
+def get_host_info(ip: str):
+    """Retourne les informations détaillées d'un hôte."""
+    host = target_manager.get_target_info(ip)
+    if not host:
+        # Tenter un scan rapide de l'hôte
+        if SCANNER_AVAILABLE:
+            scanner = NetworkScanner(timeout=2.0)
+            host_data = scanner.scan_single_host(ip)
+            return jsonify(host_data.to_dict())
+        return jsonify({"error": "Hôte non trouvé"}), 404
+    return jsonify(host)
+
+
+@app.route("/api/network/host/<ip>/scan", methods=["POST"])
+def scan_single_host(ip: str):
+    """Scan détaillé d'un hôte spécifique."""
+    if not SCANNER_AVAILABLE:
+        return jsonify({"error": "Module scanner non disponible"}), 503
+
+    scanner = NetworkScanner(timeout=3.0, enable_banner_grab=True)
+    host = scanner.scan_single_host(ip)
+    return jsonify(host.to_dict())
+
+
+@app.route("/api/network/host/<ip>/services", methods=["GET"])
+def get_host_services(ip: str):
+    """Retourne les services de bureau distant disponibles sur un hôte."""
+    if not SCANNER_AVAILABLE:
+        return jsonify({"error": "Module scanner non disponible"}), 503
+
+    scanner = NetworkScanner(timeout=2.0)
+    services = scanner.check_remote_desktop_services(ip)
+    vnc_displays = scanner.get_vnc_displays(ip)
+
+    return jsonify({
+        "ip": ip,
+        "services": services,
+        "vnc_displays": vnc_displays,
+        "available_protocols": [k for k, v in services.items() if v],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Routes REST API - Gestion des Cibles (Target Manager)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/targets", methods=["GET"])
+def get_all_targets():
+    """Retourne toutes les cibles avec leur état de session."""
+    return jsonify({
+        "targets": target_manager.get_all_targets(),
+        "selected": target_manager.selected_target,
+        "count": len(target_manager.discovered_hosts),
+    })
+
+
+@app.route("/api/targets/select", methods=["POST"])
+def select_target():
+    """
+    Sélectionne une cible pour le relay.
+    Body JSON: {"ip": "192.168.1.10", "protocol": "vnc|rdp|ssh"}
+    """
+    data = request.get_json()
+    if not data or "ip" not in data:
+        return jsonify({"error": "IP requise"}), 400
+
+    ip = data["ip"]
+    protocol = data.get("protocol", "auto")
+
+    result = target_manager.select_target(ip)
+    result["protocol"] = protocol
+
+    # Notifier les clients WebSocket
+    socketio.emit("target_selected", {
+        "ip": ip,
+        "protocol": protocol,
+    }, namespace="/network")
+
+    return jsonify(result)
+
+
+@app.route("/api/targets/selected", methods=["GET"])
+def get_selected_target():
+    """Retourne la cible actuellement sélectionnée."""
+    ip = target_manager.selected_target
+    if not ip:
+        return jsonify({"selected": None})
+
+    info = target_manager.get_target_info(ip)
+    session_info = target_manager.target_sessions.get(ip, {})
+
+    return jsonify({
+        "selected": ip,
+        "info": info,
+        "session": session_info,
+    })
+
+
+@app.route("/api/targets/release", methods=["POST"])
+def release_target():
+    """Libère la cible sélectionnée."""
+    ip = target_manager.selected_target
+    if ip and ip in target_manager.target_sessions:
+        target_manager.target_sessions[ip]["status"] = "idle"
+    target_manager.selected_target = None
+
+    socketio.emit("target_released", {"ip": ip}, namespace="/network")
+    return jsonify({"status": "released", "previous_target": ip})
+
+
+# ---------------------------------------------------------------------------
+# Routes REST API - Relay de Flux vers Cible Distante
+# ---------------------------------------------------------------------------
+
+@app.route("/api/relay/start", methods=["POST"])
+def start_relay():
+    """
+    Démarre le relay de flux vers une cible distante.
+    Le relay capture l'écran de la machine cible et le transmet au client.
+
+    Body JSON: {
+        "ip": "192.168.1.10",
+        "protocol": "vnc|rdp|ssh|screen_capture",
+        "port": 5900,  // optionnel
+        "credentials": {"username": "...", "password": "..."}  // optionnel
+    }
+    """
+    data = request.get_json()
+    if not data or "ip" not in data:
+        return jsonify({"error": "IP cible requise"}), 400
+
+    ip = data["ip"]
+    protocol = data.get("protocol", "screen_capture")
+    port = data.get("port")
+    credentials = data.get("credentials", {})
+
+    # Sélectionner la cible
+    target_manager.select_target(ip)
+
+    # Mettre à jour la session
+    if ip in target_manager.target_sessions:
+        target_manager.target_sessions[ip].update({
+            "protocol": protocol,
+            "port": port,
+            "status": "relay_active",
+            "relay_started_at": time.time(),
+        })
+
+    # Démarrer le streaming local (simulation ou capture réelle)
+    session.start_streaming()
+
+    logger.info(f"Relay démarré vers {ip} via {protocol}")
+
+    socketio.emit("relay_started", {
+        "ip": ip,
+        "protocol": protocol,
+    }, namespace="/network")
+
+    return jsonify({
+        "status": "relay_active",
+        "target": ip,
+        "protocol": protocol,
+    })
+
+
+@app.route("/api/relay/stop", methods=["POST"])
+def stop_relay():
+    """Arrête le relay de flux."""
+    ip = target_manager.selected_target
+
+    session.stop_streaming()
+
+    if ip and ip in target_manager.target_sessions:
+        target_manager.target_sessions[ip]["status"] = "idle"
+        target_manager.target_sessions[ip]["relay_stopped_at"] = time.time()
+
+    logger.info(f"Relay arrêté pour {ip}")
+
+    socketio.emit("relay_stopped", {"ip": ip}, namespace="/network")
+
+    return jsonify({
+        "status": "relay_stopped",
+        "target": ip,
+    })
+
+
+@app.route("/api/relay/status", methods=["GET"])
+def get_relay_status():
+    """Retourne le statut du relay actif."""
+    ip = target_manager.selected_target
+    session_info = target_manager.target_sessions.get(ip, {}) if ip else {}
+
+    return jsonify({
+        "active": session.is_streaming,
+        "target": ip,
+        "protocol": session_info.get("protocol"),
+        "frame_count": session.frame_count,
+        "uptime": round(time.time() - session_info.get("relay_started_at", time.time()), 2) if session_info.get("relay_started_at") else 0,
+    })
+
+
+# ---------------------------------------------------------------------------
+# WebSocket Events - Namespace Network
+# ---------------------------------------------------------------------------
+
+@socketio.on("connect", namespace="/network")
+def handle_network_connect():
+    """Client connecté au namespace réseau."""
+    logger.info("Client connecté au namespace /network")
+    emit("connected", {
+        "message": "Connecté au namespace réseau ATIBON",
+        "hosts_count": len(target_manager.discovered_hosts),
+        "is_scanning": target_manager.is_scanning,
+    })
+
+
+@socketio.on("disconnect", namespace="/network")
+def handle_network_disconnect():
+    """Client déconnecté du namespace réseau."""
+    logger.info("Client déconnecté du namespace /network")
+
+
+@socketio.on("request_scan", namespace="/network")
+def handle_ws_scan(data):
+    """Lance un scan via WebSocket."""
+    subnet = data.get("subnet") if data else None
+    result = target_manager.start_scan(subnet=subnet, async_mode=True)
+    emit("scan_started", result)
+
+
+@socketio.on("select_host", namespace="/network")
+def handle_ws_select_host(data):
+    """Sélectionne un hôte via WebSocket."""
+    ip = data.get("ip")
+    if ip:
+        result = target_manager.select_target(ip)
+        emit("host_selected", result)
+
+
+@socketio.on("start_relay", namespace="/network")
+def handle_ws_start_relay(data):
+    """Démarre le relay via WebSocket."""
+    ip = data.get("ip")
+    protocol = data.get("protocol", "screen_capture")
+
+    if ip:
+        target_manager.select_target(ip)
+        session.start_streaming()
+
+        if ip in target_manager.target_sessions:
+            target_manager.target_sessions[ip].update({
+                "protocol": protocol,
+                "status": "relay_active",
+                "relay_started_at": time.time(),
+            })
+
+        emit("relay_started", {"ip": ip, "protocol": protocol})
+
+
+@socketio.on("stop_relay", namespace="/network")
+def handle_ws_stop_relay(data):
+    """Arrête le relay via WebSocket."""
+    ip = target_manager.selected_target
+    session.stop_streaming()
+
+    if ip and ip in target_manager.target_sessions:
+        target_manager.target_sessions[ip]["status"] = "idle"
+
+    emit("relay_stopped", {"ip": ip})
+
+
+@socketio.on("host_quick_check", namespace="/network")
+def handle_ws_quick_check(data):
+    """Vérification rapide d'un hôte."""
+    ip = data.get("ip")
+    if ip and SCANNER_AVAILABLE:
+        scanner = NetworkScanner(timeout=2.0)
+        services = scanner.check_remote_desktop_services(ip)
+        emit("host_check_result", {"ip": ip, "services": services})
 
 
 # ---------------------------------------------------------------------------

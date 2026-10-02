@@ -22,13 +22,15 @@ import {
   Zap,
   Globe,
   Lock,
+  Radar,
 } from "lucide-react";
 import RemoteDesktopViewer from "./components/RemoteDesktopViewer";
+import NetworkTopology from "./components/NetworkTopology";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-type ActiveView = "dashboard" | "remote-desktop" | "machines" | "logs";
+type ActiveView = "dashboard" | "remote-desktop" | "network" | "machines" | "logs";
 
 interface MachineInfo {
   id: string;
@@ -109,6 +111,7 @@ const App: React.FC = () => {
           {[
             { id: "dashboard" as ActiveView, icon: LayoutDashboard, label: "Tableau de bord" },
             { id: "remote-desktop" as ActiveView, icon: Monitor, label: "Bureau Distant" },
+            { id: "network" as ActiveView, icon: Radar, label: "Réseau & Cibles" },
             { id: "machines" as ActiveView, icon: Server, label: "Machines" },
             { id: "logs" as ActiveView, icon: Terminal, label: "Logs & Monitoring" },
           ].map((item) => (
@@ -173,12 +176,16 @@ const App: React.FC = () => {
                   ? "Prise de Contrôle à Distance"
                   : activeView === "dashboard"
                   ? "Tableau de Bord"
+                  : activeView === "network"
+                  ? "Découverte Réseau & Cibles"
                   : activeView === "machines"
                   ? "Gestion des Machines"
                   : "Logs & Monitoring"}
               </h2>
               <p className="text-xs" style={{ color: "#666" }}>
-                Module de bureau distant — Type TeamViewer / VNC
+                {activeView === "network"
+                  ? "Balayage de sous-réseau — Détection d'hôtes et services"
+                  : "Module de bureau distant — Type TeamViewer / VNC"}
               </p>
             </div>
           </div>
@@ -207,8 +214,10 @@ const App: React.FC = () => {
         <div className="flex-1 overflow-hidden">
           {activeView === "remote-desktop" ? (
             <RemoteDesktopViewer />
+          ) : activeView === "network" ? (
+            <NetworkTopology />
           ) : activeView === "dashboard" ? (
-            <DashboardView machines={MOCK_MACHINES} onOpenRemote={() => setActiveView("remote-desktop")} />
+            <DashboardView machines={MOCK_MACHINES} onOpenRemote={() => setActiveView("remote-desktop")} onOpenNetwork={() => setActiveView("network")} />
           ) : activeView === "machines" ? (
             <MachinesView machines={MOCK_MACHINES} />
           ) : (
@@ -223,7 +232,7 @@ const App: React.FC = () => {
 // ---------------------------------------------------------------------------
 // Dashboard View
 // ---------------------------------------------------------------------------
-const DashboardView: React.FC<{ machines: MachineInfo[]; onOpenRemote: () => void }> = ({ machines, onOpenRemote }) => {
+const DashboardView: React.FC<{ machines: MachineInfo[]; onOpenRemote: () => void; onOpenNetwork: () => void }> = ({ machines, onOpenRemote, onOpenNetwork }) => {
   const onlineCount = machines.filter((m) => m.status === "online").length;
   const avgCpu = Math.round(machines.filter(m => m.cpu > 0).reduce((a, m) => a + m.cpu, 0) / machines.filter(m => m.cpu > 0).length);
   const avgRam = Math.round(machines.filter(m => m.ram > 0).reduce((a, m) => a + m.ram, 0) / machines.filter(m => m.ram > 0).length);
@@ -285,6 +294,38 @@ const DashboardView: React.FC<{ machines: MachineInfo[]; onOpenRemote: () => voi
             </p>
           </div>
           <ChevronRight size={24} style={{ color: "#D4AF37" }} />
+        </div>
+      </div>
+
+      {/* Quick Access - Network Topology */}
+      <div
+        className="p-6 rounded-xl mb-6 cursor-pointer transition-all hover:scale-[1.01]"
+        onClick={onOpenNetwork}
+        style={{
+          background: "linear-gradient(135deg, rgba(0, 240, 255, 0.06), rgba(212, 175, 55, 0.04))",
+          border: "1px solid rgba(0, 240, 255, 0.25)",
+          boxShadow: "0 0 30px rgba(0, 240, 255, 0.03)",
+        }}
+      >
+        <div className="flex items-center gap-4">
+          <div
+            className="w-14 h-14 rounded-xl flex items-center justify-center"
+            style={{
+              background: "rgba(0, 240, 255, 0.08)",
+              border: "1px solid rgba(0, 240, 255, 0.25)",
+            }}
+          >
+            <Radar size={28} style={{ color: "#00F0FF" }} />
+          </div>
+          <div className="flex-1">
+            <h3 className="text-lg font-bold" style={{ color: "#00F0FF" }}>
+              Topologie Réseau
+            </h3>
+            <p className="text-sm" style={{ color: "#888" }}>
+              Découvrez les machines du réseau — SSH, VNC, RDP — et connectez-vous en un clic
+            </p>
+          </div>
+          <ChevronRight size={24} style={{ color: "#00F0FF" }} />
         </div>
       </div>
 

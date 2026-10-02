@@ -1,35 +1,48 @@
-# ATIBON - Module de Prise de Contrôle à Distance
+# ATIBON - Module de Prise de Contrôle à Distance + Network Discovery
 
 ## 🖥️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     ATIBON Remote Desktop                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────────────┐     WebSocket      ┌───────────────┐  │
-│  │   FRONTEND (React)   │◄──────────────────►│  BACKEND      │  │
-│  │                      │                     │  (Flask)      │  │
-│  │  • Canvas rendering  │   frame (JPEG)     │               │  │
-│  │  • Mouse capture     │◄──────────────────►│  • MSS capture│  │
-│  │  • Keyboard capture  │   mouse/key events │  • PyAutoGUI  │  │
-│  │  • Glassmorphism UI  │───────────────────►│  • Socket.IO  │  │
-│  │                      │                     │               │  │
-│  └──────────────────────┘                     └───────────────┘  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        ATIBON Infrastructure Manager                      │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌──────────────────────┐     WebSocket      ┌────────────────────────┐  │
+│  │   FRONTEND (React)   │◄──────────────────►│  BACKEND (Flask)       │  │
+│  │                      │                     │                        │  │
+│  │  • RemoteDesktop     │   frame (JPEG)     │  • RemoteDesktopSession│  │
+│  │  • NetworkTopology   │◄──────────────────►│  • NetworkScanner      │  │
+│  │  • Dashboard         │   mouse/key events │  • TargetManager       │  │
+│  │  • Glassmorphism UI  │───────────────────►│  • Socket.IO           │  │
+│  │                      │                     │  • Relay Multi-cibles  │  │
+│  └──────────────────────┘                     └────────────────────────┘  │
+│           ▲                                          │                    │
+│           │                                          ▼                    │
+│           │                              ┌──────────────────────┐        │
+│           └──────────────────────────────│  Réseau Local        │        │
+│                                          │  ┌─────┐ ┌─────┐    │        │
+│                                          │  │SSH  │ │VNC  │    │        │
+│                                          │  └─────┘ └─────┘    │        │
+│                                          │  ┌─────┐ ┌─────┐    │        │
+│                                          │  │RDP  │ │SMB  │    │        │
+│                                          │  └─────┘ └─────┘    │        │
+│                                          └──────────────────────┘        │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 📁 Structure des fichiers
 
 ```
 ├── backend/
-│   └── server.py              # Serveur Flask + WebSocket
+│   ├── server.py              # Serveur Flask + WebSocket + Relay multi-cibles
+│   └── network_scanner.py     # Module de découverte réseau (Port Sweep)
 ├── src/
 │   ├── components/
-│   │   └── RemoteDesktopViewer.tsx  # Composant principal
-│   ├── App.tsx                # Application ATIBON
-│   ├── index.css              # Styles globaux
+│   │   ├── RemoteDesktopViewer.tsx  # Prise de contrôle à distance
+│   │   └── NetworkTopology.tsx      # Topologie réseau & sélecteur d'hôtes
+│   ├── App.tsx                # Application ATIBON principale
+│   ├── index.css              # Styles globaux (Glassmorphism)
 │   └── main.tsx               # Point d'entrée
 └── README.md
 ```
@@ -118,6 +131,69 @@ Glassmorphism :
   • box-shadow: 0 0 20px rgba(0, 240, 255, 0.1)
 ```
 
+## 🌐 Module de Découverte Réseau
+
+### `backend/network_scanner.py`
+
+Scanner de sous-réseau complet qui détecte automatiquement :
+
+| Fonctionnalité | Description |
+|---|---|
+| **Ping Sweep** | Détection d'hôtes actifs (ICMP + TCP fallback) |
+| **Port Scan** | Scan TCP des ports standards (SSH, VNC, RDP, SMB, HTTP...) |
+| **Banner Grabbing** | Récupération des bannières de service |
+| **DNS Reverse** | Résolution inverse des adresses IP |
+| **MAC Detection** | Détection des adresses MAC via ARP |
+| **Vendor Lookup** | Identification du fabricant via OUI |
+| **OS Fingerprint** | Estimation basique du système d'exploitation |
+| **Gateway Detection** | Identification de la passerelle par défaut |
+
+**Ports scannés par défaut :**
+- `22` (SSH), `23` (Telnet), `80` (HTTP), `135/139/445` (SMB)
+- `443` (HTTPS), `3389` (RDP), `5900-5905` (VNC), `8080` (HTTP alt)
+
+### Routes API - Découverte Réseau
+
+| Endpoint | Méthode | Description |
+|---|---|---|
+| `/api/network/subnet` | GET | Détecte le sous-réseau local |
+| `/api/network/scan` | POST | Lance un scan asynchrone |
+| `/api/network/scan/sync` | POST | Lance un scan synchrone |
+| `/api/network/scan/status` | GET | Statut du scan en cours |
+| `/api/network/hosts` | GET | Liste des hôtes découverts |
+| `/api/network/host/<ip>` | GET | Détails d'un hôte |
+| `/api/network/host/<ip>/scan` | POST | Scan détaillé d'un hôte |
+| `/api/network/host/<ip>/services` | GET | Services de contrôle distant |
+
+### Routes API - Gestion des Cibles
+
+| Endpoint | Méthode | Description |
+|---|---|---|
+| `/api/targets` | GET | Toutes les cibles avec état |
+| `/api/targets/select` | POST | Sélectionne une cible |
+| `/api/targets/selected` | GET | Cible actuellement sélectionnée |
+| `/api/targets/release` | POST | Libère la cible |
+| `/api/relay/start` | POST | Démarre le relay de flux |
+| `/api/relay/stop` | POST | Arrête le relay |
+| `/api/relay/status` | GET | Statut du relay actif |
+
+### Composant React - NetworkTopology
+
+Le composant `NetworkTopology.tsx` offre :
+
+| Fonctionnalité | Description |
+|---|---|
+| **Scan réseau** | Lancement du balayage avec barre de progression |
+| **Vue grille** | Cartes interactives des hôtes découverts |
+| **Vue liste** | Tableau détaillé avec toutes les colonnes |
+| **Vue topologie** | Représentation graphique en étoile |
+| **Filtrage** | Par service (SSH, VNC, RDP, HTTP, Gateway) |
+| **Recherche** | Par IP, hostname, vendor, OS |
+| **Tri** | Par IP, nom, latence, nombre de services |
+| **Détail hôte** | Panneau latéral avec ports, bannières, actions |
+| **Relay rapide** | Boutons VNC/RDP/SSH pour connexion instantanée |
+| **Statistiques** | Compteurs temps réel par type de service |
+
 ## 🔐 Sécurité
 
 - Authentification à implémenter (JWT recommandé)
@@ -125,6 +201,8 @@ Glassmorphism :
 - Rate limiting sur les événements WebSocket
 - Validation des coordonnées souris (bornes écran)
 - Logs d'audit pour toutes les actions
+- **Restriction du scan aux plages IP autorisées**
+- **Vérification des credentials avant relay**
 
 ## 📝 Notes
 
